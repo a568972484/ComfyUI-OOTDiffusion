@@ -6,9 +6,13 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from PIL import Image
 from torchvision.transforms.functional import to_pil_image, to_tensor
-
+import torch
 from .inference_ootd import OOTDiffusion
 from .ootd_utils import get_mask_location
+from torchvision.transforms import ToTensor
+from torchvision import transforms
+
+transform = transforms.ToTensor()
 
 _category_get_mask_input = {
     "upperbody": "upper_body",
@@ -103,6 +107,7 @@ class OOTDGenerate:
                 # "keypoints": ("POSE_KEYPOINT",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                "num_samples": ("INT", {"default": 1, "min": 1, "max": 10}),
                 "cfg": (
                     "FLOAT",
                     {
@@ -117,14 +122,14 @@ class OOTDGenerate:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE")
-    RETURN_NAMES = ("image", "image_masked")
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
     FUNCTION = "generate"
 
     CATEGORY = "OOTD"
 
     def generate(
-        self, pipe: OOTDiffusion, cloth_image, model_image, category, seed, steps, cfg
+        self, pipe: OOTDiffusion, cloth_image, model_image, category, seed, steps,num_samples, cfg
     ):
         # if model_image.shape != (1, 1024, 768, 3) or (
         #     cloth_image.shape != (1, 1024, 768, 3)
@@ -138,60 +143,88 @@ class OOTDGenerate:
             raise ValueError(
                 "Half body (hd) model type can only be used with upperbody category"
             )
-
-        # (1,H,W,3) -> (3,H,W)
-        model_image = model_image.squeeze(0)
-        model_image = model_image.permute((2, 0, 1))
-        model_image = to_pil_image(model_image)
-        if model_image.size != (768, 1024):
-            print(f"Inconsistent model_image size {model_image.size} != (768, 1024)")
-        model_image = model_image.resize((768, 1024))
+        model_image_list = []
+        print(f"model_image:{model_image.shape}")
+        for img_index in range(len(model_image)):
+            model_image_list.append(model_image[img_index])
+        res = []
+        #model_image:torch.Size([2, 1280, 960, 3])
+        #减少一个维度
         cloth_image = cloth_image.squeeze(0)
+        #torch.Size([1280, 960, 3])
         cloth_image = cloth_image.permute((2, 0, 1))
+        #torch.Size([3,1280, 960])
         cloth_image = to_pil_image(cloth_image)
         if cloth_image.size != (768, 1024):
             print(f"Inconsistent cloth_image size {cloth_image.size} != (768, 1024)")
         cloth_image = cloth_image.resize((768, 1024))
+        print(f'列表数量{len(model_image_list)}')
+        for model_image in model_image_list:
+            model_image = model_image.squeeze(0)
+            model_image = model_image.permute((2, 0, 1))
+            model_image = to_pil_image(model_image)
+            if model_image.size != (768, 1024):
+                print(f"Inconsistent model_image size {model_image.size} != (768, 1024)")
+            model_image = model_image.resize((768, 1024))
+            model_parse, _ = pipe.parsing_model(model_image.resize((384, 512)))
+            keypoints = pipe.openpose_model(model_image.resize((384, 512)))
+            mask, mask_gray = get_mask_location(
+                pipe.model_type,
+                _category_get_mask_input[category],
+                model_parse,
+                keypoints,
+                width=384,
+                height=512,
+            )
+            mask = mask.resize((768, 1024), Image.NEAREST)
+            mask_gray = mask_gray.resize((768, 1024), Image.NEAREST)
 
-        model_parse, _ = pipe.parsing_model(model_image.resize((384, 512)))
-        keypoints = pipe.openpose_model(model_image.resize((384, 512)))
-        mask, mask_gray = get_mask_location(
-            pipe.model_type,
-            _category_get_mask_input[category],
-            model_parse,
-            keypoints,
-            width=384,
-            height=512,
-        )
-        mask = mask.resize((768, 1024), Image.NEAREST)
-        mask_gray = mask_gray.resize((768, 1024), Image.NEAREST)
+            masked_vton_img = Image.composite(mask_gray, model_image, mask)
+            images = pipe(
+                category=category,
+                image_garm=cloth_image,
+                image_vton=masked_vton_img,
+                mask=mask,
+                image_ori=model_image,
+                num_samples=num_samples,
+                num_steps=steps,
+                image_scale=cfg,
+                seed=seed,
+            )
 
-        masked_vton_img = Image.composite(mask_gray, model_image, mask)
-        images = pipe(
-            category=category,
-            image_garm=cloth_image,
-            image_vton=masked_vton_img,
-            mask=mask,
-            image_ori=model_image,
-            num_samples=1,
-            num_steps=steps,
-            image_scale=cfg,
-            seed=seed,
-        )
+            # pil(H,W,3) -> tensor(H,W,3)
+            print(f"运行成功:images:{images}")
+            for img in images:
+                #  img:torch.Size([3, 1024, 768])
+                output_image = to_tensor(img)
+                # output_image:torch.Size([1, 3, 1024, 768])
+                # print(f'output_image:{output_image.shape}')
+                # output_image = output_image.squeeze(0)
+                # print(f'output_image:{output_image.shape}')
+                res.append(output_image)
+        # tensor_batch = torch.cat(res, dim=0)
+        tensor_batch = torch.stack(res)
+        tensor_batch = tensor_batch.permute(0, 2, 3, 1)
+        print(f'tensor_batch:{tensor_batch.shape}')
+        print(tensor_batch)
+        return (tensor_batch,)
 
-        # pil(H,W,3) -> tensor(H,W,3)
-        output_image = to_tensor(images[0])
-        output_image = output_image.permute((1, 2, 0)).unsqueeze(0)
-        masked_vton_img = masked_vton_img.convert("RGB")
-        masked_vton_img = to_tensor(masked_vton_img)
-        masked_vton_img = masked_vton_img.permute((1, 2, 0)).unsqueeze(0)
+def images_to_batch(images):
 
-        return (output_image, masked_vton_img)
+    # 创建ToTensor转换器实例
+    to_tensor = ToTensor()
 
+    # 将图像列表转换为张量列表
+    tensors = [img.squeeze(0)  for img in images]
+
+    # 将张量列表堆叠为一个批量张量
+    batch_tensor = torch.stack(tensors)
+
+    return batch_tensor
 
 _export_classes = [
     LoadOOTDPipeline,
-    LoadOOTDPipelineHub,
+   # LoadOOTDPipelineHub,
     OOTDGenerate,
 ]
 
